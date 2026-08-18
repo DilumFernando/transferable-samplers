@@ -716,7 +716,7 @@ def run_official_sbg(
         "trainer=gpu" if device.type == "cuda" else "trainer=cpu",
         "logger=csv",
         f"paths.output_dir={output_dir}",
-        f"callbacks.sampling_evaluation.output_dir={output_dir}",
+        f"+callbacks.sampling_evaluation.output_dir={output_dir}",
         f"callbacks.sampling_evaluation.sampler.num_samples={config.num_particles}",
         f"callbacks.sampling_evaluation.sampler.num_annealing_steps={config.num_annealing_steps}",
     ]
@@ -746,7 +746,7 @@ def run_official_ecnf(
         "trainer=gpu" if device.type == "cuda" else "trainer=cpu",
         "logger=csv",
         f"paths.output_dir={output_dir}",
-        f"callbacks.sampling_evaluation.output_dir={output_dir}",
+        f"+callbacks.sampling_evaluation.output_dir={output_dir}",
         f"callbacks.sampling_evaluation.sampler.num_samples={config.num_particles}",
     ]
     print("Official ECNF++ command:\n" + " ".join(map(str, command)), flush=True)
