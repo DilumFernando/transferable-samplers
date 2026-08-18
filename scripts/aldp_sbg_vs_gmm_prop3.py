@@ -5,8 +5,8 @@ The default invocation is a small smoke test. Pass ``--full`` for the
 paper-scale particle count, annealing schedule, and drift-training budget.
 
 Examples:
-    python scripts/aldp_sbg_vs_gmm_prop3.py
-    python scripts/aldp_sbg_vs_gmm_prop3.py --full
+    python scripts/aldp_sbg_vs_gmm_prop3.py --method2-only
+    python scripts/aldp_sbg_vs_gmm_prop3.py --full --method2-only
     python scripts/aldp_sbg_vs_gmm_prop3.py --full --run-official-baselines
 """
 
@@ -69,6 +69,7 @@ class ExperimentConfig:
     sigma_min: float
     log_every: int
     checkpoint_every: int
+    method2_only: bool
     run_official_sbg: bool
     run_official_ecnf: bool
 
@@ -80,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--full", action="store_true", help="Use the full 100k-step, 10k-particle configuration.")
+    parser.add_argument(
+        "--method2-only",
+        action="store_true",
+        help="Skip and ignore official baselines; evaluate only GMM + Proposition 3.",
+    )
     parser.add_argument("--run-official-sbg", action="store_true", help="Run the official TarFlow + ULA-SMC baseline.")
     parser.add_argument("--run-official-ecnf", action="store_true", help="Run the official ECNF++ + SNIS baseline.")
     parser.add_argument(
@@ -123,6 +129,8 @@ def parse_args() -> argparse.Namespace:
 def resolve_config(args: argparse.Namespace, device: torch.device) -> ExperimentConfig:
     """Resolve smoke/full defaults and explicit command-line overrides."""
     smoke = not args.full
+    if args.method2_only and (args.run_official_sbg or args.run_official_ecnf or args.run_official_baselines):
+        raise ValueError("--method2-only cannot be combined with official-baseline flags")
 
     def choose(value: Any, smoke_value: Any, full_value: Any) -> Any:
         return value if value is not None else (smoke_value if smoke else full_value)
@@ -146,6 +154,7 @@ def resolve_config(args: argparse.Namespace, device: torch.device) -> Experiment
         sigma_min=args.sigma_min,
         log_every=args.log_every,
         checkpoint_every=choose(args.checkpoint_every, 0, 10_000),
+        method2_only=args.method2_only,
         run_official_sbg=args.run_official_sbg or args.run_official_baselines,
         run_official_ecnf=args.run_official_ecnf or args.run_official_baselines,
     )
@@ -790,7 +799,7 @@ def save_comparison_plots(
         (
             "full-cov GMM + Prop. 3",
             comparison_samples["gmm_prop3"].samples,
-            comparison_samples["gmm_prop3"].logw,
+            None,
         )
     )
 
@@ -811,6 +820,26 @@ def save_comparison_plots(
             title=title,
         )
     save_figure(fig, run_dir / "plots" / "comparison" / "ramachandran")
+
+    raw_phi, raw_psi = rama(method2["samples"], datamodule.std, eval_context.topology)
+    raw_weights = torch.softmax(method2["logw"].detach().cpu(), 0).numpy()
+    fig, ax = plt.subplots(figsize=(5, 4.2), constrained_layout=True)
+    ax.hexbin(
+        raw_phi,
+        raw_psi,
+        C=raw_weights,
+        reduce_C_function=np.sum,
+        gridsize=55,
+        mincnt=1,
+    )
+    ax.set(
+        xlim=(-180, 180),
+        ylim=(-180, 180),
+        xlabel=r"$\phi$ (deg)",
+        ylabel=r"$\psi$ (deg)",
+        title="GMM + Prop. 3 weighted before final resampling",
+    )
+    save_figure(fig, run_dir / "plots" / "comparison" / "weighted_pre_resampling_ramachandran")
 
     diagnostics = method2["diagnostics"]
     times = np.asarray(diagnostics["t"], dtype=float)
@@ -846,28 +875,45 @@ def evaluate_and_save(
     eval_context: Any,
     datamodule: SinglePeptideDataModule,
     config: ExperimentConfig,
-    sbg_sample_file: Path,
-    sbg_diagnostics_file: Path,
-    ecnf_sample_file: Path,
+    sbg_sample_file: Path | None,
+    sbg_diagnostics_file: Path | None,
+    ecnf_sample_file: Path | None,
 ) -> dict[str, Any]:
     """Run repository metrics and save all evaluation plots and summaries."""
+    final_generator = torch.Generator(device=method2["logw"].device).manual_seed(config.seed + 3)
+    final_index = torch.multinomial(
+        torch.softmax(method2["logw"], dim=0),
+        len(method2["logw"]),
+        replacement=True,
+        generator=final_generator,
+    )
+    final_resampled = SamplesData(
+        method2["samples"][final_index].cpu(),
+        method2["target_energy"][final_index].cpu(),
+        logw=method2["logw"].cpu(),
+    )
+    torch.save(
+        {
+            "samples": final_resampled.samples,
+            "target_energy": final_resampled.E_target,
+            "pre_resampling_logw": final_resampled.logw,
+            "resampling_index": final_index.cpu(),
+        },
+        run_dir / "samples" / "gmm_prop3_final_resampled.pt",
+    )
     comparison_samples = {
-        "gmm_prop3": SamplesData(
-            method2["samples"].cpu(),
-            method2["target_energy"].cpu(),
-            logw=method2["logw"].cpu(),
-        )
+        "gmm_prop3": final_resampled,
     }
     sbg_diagnostics = None
-    if ecnf_sample_file.exists():
+    if ecnf_sample_file is not None and ecnf_sample_file.exists():
         official_ecnf = torch.load(ecnf_sample_file, map_location="cpu", weights_only=False)
         if "resampled" not in official_ecnf:
             raise KeyError(f"Expected 'resampled' in official ECNF++ artifact {ecnf_sample_file}")
         comparison_samples["ecnf_snis"] = samples_data_to_cpu(official_ecnf["resampled"])
-    if sbg_sample_file.exists():
+    if sbg_sample_file is not None and sbg_sample_file.exists():
         official = torch.load(sbg_sample_file, map_location="cpu", weights_only=False)
         comparison_samples["sbg_smc"] = samples_data_to_cpu(official["smc"])
-        if sbg_diagnostics_file.exists():
+        if sbg_diagnostics_file is not None and sbg_diagnostics_file.exists():
             sbg_diagnostics = torch.load(sbg_diagnostics_file, map_location="cpu", weights_only=False)
 
     evaluator_plot_root = run_dir / "plots" / "evaluator"
@@ -892,8 +938,10 @@ def evaluate_and_save(
 
     summary = {
         "final_segment_ess_over_n": Prop3Experiment.normalized_ess(method2["logw"]),
-        "resampling_events": method2["num_resamples"],
+        "intermediate_resampling_events": method2["num_resamples"],
+        "mandatory_final_resampling": True,
         "particles": len(method2["samples"]),
+        "evaluation_samples": "mandatory final multinomial resample",
         "official_sbg_included": "sbg_smc" in comparison_samples,
         "official_ecnf_included": "ecnf_snis" in comparison_samples,
         "ecnf_snis_ess_over_n": (
@@ -945,18 +993,24 @@ def main() -> None:
     write_json(run_dir / "config.json", {**asdict(config), "scratch_dir": scratch_dir, "run_dir": run_dir})
     print({"run_dir": str(run_dir), **asdict(config)}, flush=True)
 
-    sbg_variant = f"{mode}_n{config.num_particles}_steps{config.num_annealing_steps}"
-    sbg_sample_file, sbg_diagnostics_file = run_official_sbg(
-        args.output_dir.expanduser().resolve() / "official_sbg" / sbg_variant,
-        config,
-        device,
-    )
-    ecnf_variant = f"{mode}_n{config.num_particles}"
-    ecnf_sample_file = run_official_ecnf(
-        args.output_dir.expanduser().resolve() / "official_ecnf" / ecnf_variant,
-        config,
-        device,
-    )
+    if config.method2_only:
+        sbg_sample_file = None
+        sbg_diagnostics_file = None
+        ecnf_sample_file = None
+        print("Method-2-only mode: official baselines and cached baseline artifacts are ignored.", flush=True)
+    else:
+        sbg_variant = f"{mode}_n{config.num_particles}_steps{config.num_annealing_steps}"
+        sbg_sample_file, sbg_diagnostics_file = run_official_sbg(
+            args.output_dir.expanduser().resolve() / "official_sbg" / sbg_variant,
+            config,
+            device,
+        )
+        ecnf_variant = f"{mode}_n{config.num_particles}"
+        ecnf_sample_file = run_official_ecnf(
+            args.output_dir.expanduser().resolve() / "official_ecnf" / ecnf_variant,
+            config,
+            device,
+        )
     datamodule, eval_context, train_y, basis = prepare_data(scratch_dir, device)
     experiment = Prop3Experiment(config, run_dir, train_y, basis, datamodule, eval_context)
     experiment.fit_gmm()
