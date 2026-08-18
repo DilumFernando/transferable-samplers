@@ -223,6 +223,17 @@ def samples_data_to_cpu(data: SamplesData) -> SamplesData:
     )
 
 
+def package_subprocess_env() -> dict[str, str]:
+    """Return an environment in which subprocesses can import the local package."""
+    environment = os.environ.copy()
+    source_dir = str(REPO_ROOT / "src")
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_dir + os.pathsep + existing_pythonpath if existing_pythonpath else source_dir
+    )
+    return environment
+
+
 class ProjectedEGNNVelocity(nn.Module):
     """ECNF++ EGNN velocity projected into the mean-free coordinate basis."""
 
@@ -712,7 +723,7 @@ def run_official_sbg(
     print("Official SBG command:\n" + " ".join(map(str, command)), flush=True)
     if config.run_official_sbg:
         output_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(command, cwd=REPO_ROOT, check=True)
+        subprocess.run(command, cwd=REPO_ROOT, env=package_subprocess_env(), check=True)
         if not sample_file.exists():
             raise FileNotFoundError(f"Official SBG run completed but did not create {sample_file}")
     elif not sample_file.exists():
@@ -741,7 +752,7 @@ def run_official_ecnf(
     print("Official ECNF++ command:\n" + " ".join(map(str, command)), flush=True)
     if config.run_official_ecnf:
         output_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(command, cwd=REPO_ROOT, check=True)
+        subprocess.run(command, cwd=REPO_ROOT, env=package_subprocess_env(), check=True)
         if not sample_file.exists():
             raise FileNotFoundError(f"Official ECNF++ run completed but did not create {sample_file}")
     elif not sample_file.exists():
