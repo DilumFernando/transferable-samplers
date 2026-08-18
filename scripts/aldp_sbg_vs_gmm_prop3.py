@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Ace-A-Nme SBG versus GMM + Proposition-3 comparison.
+"""Run the Ace-A-Nme SBG/ECNF++ versus GMM + Proposition-3 comparison.
 
 The default invocation is a small smoke test. Pass ``--full`` for the
 paper-scale particle count, annealing schedule, and drift-training budget.
@@ -7,7 +7,7 @@ paper-scale particle count, annealing schedule, and drift-training budget.
 Examples:
     python scripts/aldp_sbg_vs_gmm_prop3.py
     python scripts/aldp_sbg_vs_gmm_prop3.py --full
-    python scripts/aldp_sbg_vs_gmm_prop3.py --full --run-official-sbg
+    python scripts/aldp_sbg_vs_gmm_prop3.py --full --run-official-baselines
 """
 
 from __future__ import annotations
@@ -70,16 +70,23 @@ class ExperimentConfig:
     log_every: int
     checkpoint_every: int
     run_official_sbg: bool
+    run_official_ecnf: bool
 
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Compare official Ace-A-Nme SBG with full-covariance GMM + Proposition 3.",
+        description="Compare official Ace-A-Nme SBG and ECNF++ with full-covariance GMM + Proposition 3.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--full", action="store_true", help="Use the full 100k-step, 10k-particle configuration.")
     parser.add_argument("--run-official-sbg", action="store_true", help="Run the official TarFlow + ULA-SMC baseline.")
+    parser.add_argument("--run-official-ecnf", action="store_true", help="Run the official ECNF++ + SNIS baseline.")
+    parser.add_argument(
+        "--run-official-baselines",
+        action="store_true",
+        help="Run both official SBG and ECNF++ baselines.",
+    )
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "outputs" / "aldp_sbg_vs_prop3")
     parser.add_argument(
         "--run-name",
@@ -139,7 +146,8 @@ def resolve_config(args: argparse.Namespace, device: torch.device) -> Experiment
         sigma_min=args.sigma_min,
         log_every=args.log_every,
         checkpoint_every=choose(args.checkpoint_every, 0, 10_000),
-        run_official_sbg=args.run_official_sbg,
+        run_official_sbg=args.run_official_sbg or args.run_official_baselines,
+        run_official_ecnf=args.run_official_ecnf or args.run_official_baselines,
     )
     positive_fields = {
         "num_components": config.num_components,
@@ -712,6 +720,35 @@ def run_official_sbg(
     return sample_file, diagnostics_file
 
 
+def run_official_ecnf(
+    output_dir: Path,
+    config: ExperimentConfig,
+    device: torch.device,
+) -> Path:
+    """Optionally run the repository's official ECNF++ + SNIS baseline."""
+    sample_file = output_dir / "test" / "Ace-A-Nme" / "samples_dict.pt"
+    command = [
+        sys.executable,
+        "-m",
+        "transferable_samplers.eval",
+        "experiment=single_system/eval/ecnf++_Ace-A-Nme_snis",
+        "trainer=gpu" if device.type == "cuda" else "trainer=cpu",
+        "logger=csv",
+        f"paths.output_dir={output_dir}",
+        f"callbacks.sampling_evaluation.output_dir={output_dir}",
+        f"callbacks.sampling_evaluation.sampler.num_samples={config.num_particles}",
+    ]
+    print("Official ECNF++ command:\n" + " ".join(map(str, command)), flush=True)
+    if config.run_official_ecnf:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(command, cwd=REPO_ROOT, check=True)
+        if not sample_file.exists():
+            raise FileNotFoundError(f"Official ECNF++ run completed but did not create {sample_file}")
+    elif not sample_file.exists():
+        print("Official ECNF++ artifact absent; ECNF++ will not be included.", flush=True)
+    return sample_file
+
+
 def rama(samples: torch.Tensor, normalization_std: torch.Tensor, topology: Any) -> tuple[np.ndarray, np.ndarray]:
     """Return the alanine phi/psi angles in degrees."""
     xyz = (samples.detach().cpu() * normalization_std.cpu()).numpy()
@@ -734,6 +771,8 @@ def save_comparison_plots(
     plot_sets: list[tuple[str, torch.Tensor, torch.Tensor | None]] = [
         ("test MD", eval_context.true_data.samples, None)
     ]
+    if "ecnf_snis" in comparison_samples:
+        plot_sets.append(("official ECNF++ SNIS", comparison_samples["ecnf_snis"].samples, None))
     if "sbg_smc" in comparison_samples:
         plot_sets.append(("official SBG SMC", comparison_samples["sbg_smc"].samples, None))
     plot_sets.append(
@@ -773,6 +812,9 @@ def save_comparison_plots(
     if sbg_diagnostics is not None:
         sbg_diag = sbg_diagnostics["diagnostics"]
         ax.plot(np.asarray(sbg_diag["t"], float), np.asarray(sbg_diag["ess"], float), label="Official SBG SMC")
+    if "ecnf_snis" in comparison_samples and comparison_samples["ecnf_snis"].logw is not None:
+        ecnf_ess = Prop3Experiment.normalized_ess(comparison_samples["ecnf_snis"].logw)
+        ax.scatter([1.0], [ecnf_ess], marker="D", s=55, label="Official ECNF++ SNIS ESS")
     ax.axhline(config.ess_threshold, color="black", linestyle=":", label="resampling threshold")
     ax.set(xlabel="annealing time", ylabel="ESS/N", ylim=(0, 1), title="Annealing weight efficiency")
     ax.legend()
@@ -795,6 +837,7 @@ def evaluate_and_save(
     config: ExperimentConfig,
     sbg_sample_file: Path,
     sbg_diagnostics_file: Path,
+    ecnf_sample_file: Path,
 ) -> dict[str, Any]:
     """Run repository metrics and save all evaluation plots and summaries."""
     comparison_samples = {
@@ -805,6 +848,11 @@ def evaluate_and_save(
         )
     }
     sbg_diagnostics = None
+    if ecnf_sample_file.exists():
+        official_ecnf = torch.load(ecnf_sample_file, map_location="cpu", weights_only=False)
+        if "resampled" not in official_ecnf:
+            raise KeyError(f"Expected 'resampled' in official ECNF++ artifact {ecnf_sample_file}")
+        comparison_samples["ecnf_snis"] = samples_data_to_cpu(official_ecnf["resampled"])
     if sbg_sample_file.exists():
         official = torch.load(sbg_sample_file, map_location="cpu", weights_only=False)
         comparison_samples["sbg_smc"] = samples_data_to_cpu(official["smc"])
@@ -836,6 +884,12 @@ def evaluate_and_save(
         "resampling_events": method2["num_resamples"],
         "particles": len(method2["samples"]),
         "official_sbg_included": "sbg_smc" in comparison_samples,
+        "official_ecnf_included": "ecnf_snis" in comparison_samples,
+        "ecnf_snis_ess_over_n": (
+            Prop3Experiment.normalized_ess(comparison_samples["ecnf_snis"].logw)
+            if "ecnf_snis" in comparison_samples and comparison_samples["ecnf_snis"].logw is not None
+            else None
+        ),
         "evaluator_metrics": metrics,
     }
     write_json(run_dir / "metrics" / "summary.json", summary)
@@ -886,6 +940,12 @@ def main() -> None:
         config,
         device,
     )
+    ecnf_variant = f"{mode}_n{config.num_particles}"
+    ecnf_sample_file = run_official_ecnf(
+        args.output_dir.expanduser().resolve() / "official_ecnf" / ecnf_variant,
+        config,
+        device,
+    )
     datamodule, eval_context, train_y, basis = prepare_data(scratch_dir, device)
     experiment = Prop3Experiment(config, run_dir, train_y, basis, datamodule, eval_context)
     experiment.fit_gmm()
@@ -899,6 +959,7 @@ def main() -> None:
         config,
         sbg_sample_file,
         sbg_diagnostics_file,
+        ecnf_sample_file,
     )
     print("Final summary:", json.dumps(jsonable(summary), indent=2, sort_keys=True), flush=True)
     print(f"All artifacts saved under: {run_dir}", flush=True)
