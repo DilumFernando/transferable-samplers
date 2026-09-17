@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +41,13 @@ SNIS_EXPERIMENT = "single_system/eval/tarflow_Ace-A-Nme_snis"
 SMC_EXPERIMENT = "single_system/eval/tarflow_Ace-A-Nme_ula"
 # metrics worth keeping; the evaluator prefixes them with "test/<sequence>/<sample set>/"
 METRICS = ("energy-w2", "torsion-w2", "tica-w2", "effective-sample-size", "num-eval-samples")
+
+
+def subprocess_env() -> dict[str, str]:
+    """eval.py is run as a script, so make `src` importable whether or not the package is installed."""
+    src = str(REPO_ROOT / "src")
+    existing = os.environ.get("PYTHONPATH", "")
+    return {**os.environ, "PYTHONPATH": src + (os.pathsep + existing if existing else "")}
 
 
 def run_tag(sampler: str, size: int, steps: int, seed: int) -> str:
@@ -141,7 +149,7 @@ def main() -> None:
         print("       " + " ".join(cmd))
         if args.dry_run:
             continue
-        code = subprocess.run(cmd, cwd=REPO_ROOT).returncode
+        code = subprocess.run(cmd, cwd=REPO_ROOT, env=subprocess_env()).returncode
         if code != 0:
             print(f"[fail] {tag} exited with {code}")
     if not args.dry_run:
