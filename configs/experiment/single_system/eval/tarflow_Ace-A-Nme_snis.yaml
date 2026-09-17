@@ -1,0 +1,37 @@
+# @package _global_
+# ──────────────────────────────────────────────────────────────
+# Description: Evaluate TarFlow on Ace-A-Nme with SNIS (the "SBG SNIS" row)
+# Reference:   Tables 2 and 9, Scalable Equilibrium Sampling with Sequential Boltzmann Generators
+#              https://arxiv.org/abs/2502.18462
+# Notes:       Same proposal and filtering as tarflow_Ace-A-Nme_ula.yaml, with one
+#              importance-weighting step instead of annealed Langevin dynamics, so the
+#              number of target energy evaluations equals num_samples.
+#              Run as:
+#                python src/transferable_samplers/eval.py \
+#                experiment=single_system/eval/tarflow_Ace-A-Nme_snis.yaml \
+#                callbacks.sampling_evaluation.sampler.num_samples=1000000
+# ──────────────────────────────────────────────────────────────
+defaults:
+  - override /model: normalizing_flow
+  - override /model/net: tarflow_single_system
+  - override /data: single_system/Ace-A-Nme
+  - override /trainer: gpu
+hf_state_dict_path: single_system/tarflow_Ace-A-Nme_0.pth
+model:
+  net:
+    channels: 256
+    in_channels: 1
+    img_size: 66
+    num_blocks: 4
+    layers_per_block: 4
+  source_energy_config:
+    sample_batch_size: 2048
+    energy_batch_size: 512
+    grad_batch_size: 512
+    use_com_adjustment: true
+callbacks:
+  sampling_evaluation:
+    sampler:
+      _target_: transferable_samplers.samplers.snis_sampler.SNISSampler
+      num_samples: 10_000
+      logw_quantile_filter: 0.002
