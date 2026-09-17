@@ -67,16 +67,19 @@ def check_scratch_dir() -> None:
              "Note eval.py loads .env with override=True, so .env wins over the shell.")
 
 
-def run_tag(sampler: str, size: int, steps: int, seed: int) -> str:
-    return f"{sampler}_n{size}" + (f"_s{steps}" if sampler == "smc" else "") + f"_seed{seed}"
+def run_tag(sampler: str, size: int, steps: int, seed: int, model_seed: int = 0) -> str:
+    """Model seed 0 keeps its plain tag, so runs made before --model-seeds existed still match."""
+    return (f"{sampler}_n{size}" + (f"_s{steps}" if sampler == "smc" else "")
+            + f"_seed{seed}" + (f"_m{model_seed}" if model_seed else ""))
 
 
-def command(system: str, sampler: str, size: int, steps: int, seed: int, out: Path,
-            extra: list[str]) -> list[str]:
+def command(system: str, sampler: str, size: int, steps: int, seed: int, model_seed: int,
+            out: Path, extra: list[str]) -> list[str]:
     experiment = EXPERIMENT.format(system=system, variant="ula" if sampler == "smc" else "snis")
     cmd = [sys.executable, str(EVAL), f"experiment={experiment}", "logger=csv",
            f"seed={seed}", f"callbacks.sampling_evaluation.sampler.num_samples={size}",
-           f"hydra.run.dir={out / run_tag(sampler, size, steps, seed)}"]
+           f"hf_state_dict_path=single_system/tarflow_{system}_{model_seed}.pth",
+           f"hydra.run.dir={out / run_tag(sampler, size, steps, seed, model_seed)}"]
     if sampler == "smc":
         cmd.append(f"callbacks.sampling_evaluation.sampler.num_annealing_steps={steps}")
     return cmd + extra
@@ -104,15 +107,16 @@ def read_metrics(run_dir: Path) -> list[dict[str, str]]:
 
 def collect(out: Path, jobs: list[tuple[str, int, int, int]]) -> None:
     summary = []
-    for sampler, size, steps, seed in jobs:
-        tag = run_tag(sampler, size, steps, seed)
+    for sampler, size, steps, seed, model_seed in jobs:
+        tag = run_tag(sampler, size, steps, seed, model_seed)
         found = read_metrics(out / tag)
         if not found:
             print(f"  {tag}: no metrics yet")
             continue
         metrics = found[0]
         row = {"sampler": sampler, "num_samples": size, "steps": steps if sampler == "smc" else 0,
-               "seed": seed, "target_energy_evals": target_evals(sampler, size, steps)}
+               "seed": seed, "model_seed": model_seed,
+               "target_energy_evals": target_evals(sampler, size, steps)}
         for key, value in metrics.items():
             if any(key.endswith(m) for m in METRICS):
                 row[key.replace("test/", "")] = value
@@ -121,7 +125,8 @@ def collect(out: Path, jobs: list[tuple[str, int, int, int]]) -> None:
         print("nothing to summarise yet")
         return
     columns = sorted({k for row in summary for k in row}, key=lambda k: (k not in
-                     ("sampler", "num_samples", "steps", "seed", "target_energy_evals"), k))
+                     ("sampler", "num_samples", "steps", "seed", "model_seed",
+                      "target_energy_evals"), k))
     path = out / "summary.csv"
     with open(path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns)
@@ -144,7 +149,9 @@ def main() -> None:
     p.add_argument("--samplers", nargs="+", choices=("snis", "smc"), default=["snis"],
                    help="SMC is off by default: take its numbers from the paper's tables")
     p.add_argument("--steps", type=int, default=100, help="SMC annealing steps")
-    p.add_argument("--seeds", type=int, nargs="+", default=[0])
+    p.add_argument("--seeds", type=int, nargs="+", default=[0], help="sampling seeds (Monte Carlo noise)")
+    p.add_argument("--model-seeds", type=int, nargs="+", default=[0], choices=(0, 1, 2),
+                   help="trained TarFlow seeds; the paper's error bars are over these three")
     p.add_argument("--out", help="default: results/<system>_budget_sweep (results/aldp_budget_sweep "
                                  "for Ace-A-Nme, where the first runs landed)")
     p.add_argument("--collect", action="store_true", help="only read finished runs and summarise")
@@ -155,19 +162,19 @@ def main() -> None:
     default_out = "aldp_budget_sweep" if args.system == "Ace-A-Nme" else f"{args.system}_budget_sweep"
     out = Path(args.out) if args.out else REPO_ROOT / "results" / default_out
 
-    jobs = [(s, n, args.steps, seed) for seed in args.seeds for s in args.samplers
-            for n in (args.sizes if s == "snis" else args.smc_sizes)]
+    jobs = [(s, n, args.steps, seed, m) for m in args.model_seeds for seed in args.seeds
+            for s in args.samplers for n in (args.sizes if s == "snis" else args.smc_sizes)]
     if args.collect:
         collect(out, jobs)
         return
     check_scratch_dir()
     out.mkdir(parents=True, exist_ok=True)
-    for sampler, size, steps, seed in jobs:
-        tag = run_tag(sampler, size, steps, seed)
-        if (out / tag / "csv").exists():
+    for sampler, size, steps, seed, model_seed in jobs:
+        tag = run_tag(sampler, size, steps, seed, model_seed)
+        if (out / tag / "csv" / "version_0" / "metrics.csv").exists():
             print(f"[skip] {tag} already has results")
             continue
-        cmd = command(args.system, sampler, size, steps, seed, out, args.extra)
+        cmd = command(args.system, sampler, size, steps, seed, model_seed, out, args.extra)
         print(f"[run ] {args.system} {tag}  ({target_evals(sampler, size, steps):,} target energy evaluations)")
         print("       " + " ".join(cmd))
         if args.dry_run:
