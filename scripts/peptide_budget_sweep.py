@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
-"""Does SNIS catch up with SMC on alanine dipeptide when given the same energy budget?
+"""Does SNIS catch up with SBG's annealed inference when given the same energy budget?
 
-The paper's tables compare SNIS and SMC at the same particle count (10^4), but SMC additionally
-runs `num_annealing_steps` Langevin steps per particle, each evaluating the target energy and its
-gradient. SNIS at 10^4 samples therefore spends ~100x fewer target energy evaluations than SMC at
-10^4 particles with 100 steps. This script sweeps the SNIS sample count (10^4, 10^5, 10^6) and runs
-SMC at its usual setting, then reports every run against its target-energy-evaluation count:
+The paper's tables compare SNIS, AIS and SMC at the same particle count (10^4), but the annealed
+variants additionally run `num_annealing_steps` Langevin steps per particle, each evaluating the
+target energy and its gradient. SNIS at 10^4 samples therefore spends ~100x fewer target energy
+evaluations. This script sweeps the SNIS sample count on one peptide and reports every run against
+its target-energy-evaluation count:
 
     SNIS:  evaluations = num_samples
     SMC:   evaluations = num_samples x (num_annealing_steps + 1)
 
-so SNIS at 10^6 is budget-matched to SMC at 10^4 with 100 steps. Metrics are unchanged: the
-evaluator uses at most 10,000 conformations per metric (PeptideEnsembleEvaluator.num_eval_samples),
-so a larger sweep improves the weighted resample rather than the metric sample size.
+so SNIS at 10^6 is budget-matched to the published SMC/AIS numbers (10^4 particles, 100 steps),
+which can be read off Tables 2, 3, 9 and 10 rather than rerun. SMC is available with
+`--samplers snis smc` for a within-pipeline comparison, but is not run by default.
+
+Metrics are unchanged by the sweep size: the evaluator uses at most 10,000 conformations per metric
+(PeptideEnsembleEvaluator.num_eval_samples), so more samples improve the weighted resample rather
+than the metric sample size.
 
 Each run is one `src/transferable_samplers/eval.py` invocation with hydra overrides, writing to its
-own directory; metrics are read back from the CSV logger. Nothing is trained.
+own directory; metrics are read back from the CSV logger. Nothing is trained: every run reuses the
+published TarFlow weights for that system.
 
-    python scripts/aldp_budget_sweep.py --dry-run                      # print the commands
-    python scripts/aldp_budget_sweep.py --sizes 10000 100000 1000000 --seeds 0 1 2
-    python scripts/aldp_budget_sweep.py --collect                      # re-read finished runs
+    python scripts/peptide_budget_sweep.py --system AAA --dry-run          # print the commands
+    python scripts/peptide_budget_sweep.py --system Ace-A-Nme --seeds 0 1 2
+    python scripts/peptide_budget_sweep.py --system AAAAAA --collect       # re-read finished runs
 
-Results: <out>/<run tag>/ per run, and <out>/summary.csv over all of them.
-Prerequisites: the Ace-A-Nme dataset under paths.data_dir and the HuggingFace TarFlow weights
-(hf_state_dict_path), i.e. whatever the stock eval configs already need.
+Systems: Ace-A-Nme (alanine dipeptide), AAA (trialanine), Ace-AAA-Nme (alanine tetrapeptide),
+AAAAAA (hexa-alanine). Results: <out>/<run tag>/ per run, and <out>/summary.csv over all of them.
+Prerequisites: the system's dataset under paths.data_dir, the HuggingFace TarFlow weights, and
+SCRATCH_DIR (shell or .env), i.e. whatever the stock eval configs already need.
 """
 
 from __future__ import annotations
@@ -37,8 +43,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EVAL = REPO_ROOT / "src" / "transferable_samplers" / "eval.py"
-SNIS_EXPERIMENT = "single_system/eval/tarflow_Ace-A-Nme_snis"
-SMC_EXPERIMENT = "single_system/eval/tarflow_Ace-A-Nme_ula"
+SYSTEMS = ("Ace-A-Nme", "AAA", "Ace-AAA-Nme", "AAAAAA")     # dipeptide, tri-, tetra-, hexa-
+EXPERIMENT = "single_system/eval/tarflow_{system}_{variant}"  # variant: snis, or ula for SMC
 # metrics worth keeping; the evaluator prefixes them with "test/<sequence>/<sample set>/".
 # The paper's T-W2 is logged as "torus-w2"; "energy-w1" is the tail-sensitive companion to energy-w2.
 METRICS = ("energy-w2", "energy-w1", "torus-w2", "torus-k-jsd", "tica-w2", "tica-k-jsd",
@@ -65,8 +71,9 @@ def run_tag(sampler: str, size: int, steps: int, seed: int) -> str:
     return f"{sampler}_n{size}" + (f"_s{steps}" if sampler == "smc" else "") + f"_seed{seed}"
 
 
-def command(sampler: str, size: int, steps: int, seed: int, out: Path, extra: list[str]) -> list[str]:
-    experiment = SMC_EXPERIMENT if sampler == "smc" else SNIS_EXPERIMENT
+def command(system: str, sampler: str, size: int, steps: int, seed: int, out: Path,
+            extra: list[str]) -> list[str]:
+    experiment = EXPERIMENT.format(system=system, variant="ula" if sampler == "smc" else "snis")
     cmd = [sys.executable, str(EVAL), f"experiment={experiment}", "logger=csv",
            f"seed={seed}", f"callbacks.sampling_evaluation.sampler.num_samples={size}",
            f"hydra.run.dir={out / run_tag(sampler, size, steps, seed)}"]
@@ -133,16 +140,20 @@ def main() -> None:
                    help="SNIS sample counts to sweep")
     p.add_argument("--smc-sizes", type=int, nargs="+", default=[10_000],
                    help="SMC particle counts (its cost is this times the step count)")
-    p.add_argument("--samplers", nargs="+", choices=("snis", "smc"), default=["snis", "smc"])
+    p.add_argument("--system", choices=SYSTEMS, default="Ace-A-Nme", help="which peptide to evaluate")
+    p.add_argument("--samplers", nargs="+", choices=("snis", "smc"), default=["snis"],
+                   help="SMC is off by default: take its numbers from the paper's tables")
     p.add_argument("--steps", type=int, default=100, help="SMC annealing steps")
     p.add_argument("--seeds", type=int, nargs="+", default=[0])
-    p.add_argument("--out", default=str(REPO_ROOT / "results" / "aldp_budget_sweep"))
+    p.add_argument("--out", help="default: results/<system>_budget_sweep (results/aldp_budget_sweep "
+                                 "for Ace-A-Nme, where the first runs landed)")
     p.add_argument("--collect", action="store_true", help="only read finished runs and summarise")
     p.add_argument("--dry-run", action="store_true", help="print the commands without running them")
     p.add_argument("--extra", nargs=argparse.REMAINDER, default=[],
                    help="further hydra overrides, passed through verbatim (put this last)")
     args = p.parse_args()
-    out = Path(args.out)
+    default_out = "aldp_budget_sweep" if args.system == "Ace-A-Nme" else f"{args.system}_budget_sweep"
+    out = Path(args.out) if args.out else REPO_ROOT / "results" / default_out
 
     jobs = [(s, n, args.steps, seed) for seed in args.seeds for s in args.samplers
             for n in (args.sizes if s == "snis" else args.smc_sizes)]
@@ -156,8 +167,8 @@ def main() -> None:
         if (out / tag / "csv").exists():
             print(f"[skip] {tag} already has results")
             continue
-        cmd = command(sampler, size, steps, seed, out, args.extra)
-        print(f"[run ] {tag}  ({target_evals(sampler, size, steps):,} target energy evaluations)")
+        cmd = command(args.system, sampler, size, steps, seed, out, args.extra)
+        print(f"[run ] {args.system} {tag}  ({target_evals(sampler, size, steps):,} target energy evaluations)")
         print("       " + " ".join(cmd))
         if args.dry_run:
             continue
