@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import os
 import re
 import subprocess
@@ -45,7 +46,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EVAL = REPO_ROOT / "src" / "transferable_samplers" / "eval.py"
 SYSTEMS = ("Ace-A-Nme", "AAA", "Ace-AAA-Nme", "AAAAAA")     # dipeptide, tri-, tetra-, hexa-
-EXPERIMENT = "single_system/eval/tarflow_{system}_{variant}"  # variant: snis, or ula for SMC
+EXPERIMENT = "single_system/eval/tarflow_{system}_{variant}"  # variant: snis, or ula for ais/smc
+# The annealed arms share one config: SMC resamples when normalized ESS falls below the threshold,
+# AIS is the same run with intermediate resampling disabled (negative threshold), as in the paper.
+ESS_THRESHOLD = {"smc": 0.5, "ais": -1.0}
 # metrics worth keeping; the evaluator prefixes them with "test/<sequence>/<sample set>/".
 # The paper's T-W2 is logged as "torus-w2"; "energy-w1" is the tail-sensitive companion to energy-w2.
 METRICS = ("energy-w2", "energy-w1", "torus-w2", "torus-k-jsd", "tica-w2", "tica-k-jsd",
@@ -70,24 +74,25 @@ def check_scratch_dir() -> None:
 
 def run_tag(sampler: str, size: int, steps: int, seed: int, model_seed: int = 0) -> str:
     """Model seed 0 keeps its plain tag, so runs made before --model-seeds existed still match."""
-    return (f"{sampler}_n{size}" + (f"_s{steps}" if sampler == "smc" else "")
+    return (f"{sampler}_n{size}" + (f"_s{steps}" if sampler in ESS_THRESHOLD else "")
             + f"_seed{seed}" + (f"_m{model_seed}" if model_seed else ""))
 
 
 def command(system: str, sampler: str, size: int, steps: int, seed: int, model_seed: int,
             out: Path, extra: list[str]) -> list[str]:
-    experiment = EXPERIMENT.format(system=system, variant="ula" if sampler == "smc" else "snis")
+    experiment = EXPERIMENT.format(system=system, variant="snis" if sampler == "snis" else "ula")
     cmd = [sys.executable, str(EVAL), f"experiment={experiment}", "logger=csv",
            f"seed={seed}", f"callbacks.sampling_evaluation.sampler.num_samples={size}",
            f"hf_state_dict_path=single_system/tarflow_{system}_{model_seed}.pth",
            f"hydra.run.dir={out / run_tag(sampler, size, steps, seed, model_seed)}"]
-    if sampler == "smc":
-        cmd.append(f"callbacks.sampling_evaluation.sampler.num_annealing_steps={steps}")
+    if sampler in ESS_THRESHOLD:
+        cmd += [f"callbacks.sampling_evaluation.sampler.num_annealing_steps={steps}",
+                f"callbacks.sampling_evaluation.sampler.ess_threshold={ESS_THRESHOLD[sampler]}"]
     return cmd + extra
 
 
 def target_evals(sampler: str, size: int, steps: int) -> int:
-    """Target energy evaluations: one per sample for SNIS, one per particle per step for SMC."""
+    """Target energy evaluations: one per sample for SNIS, one per particle per step when annealing."""
     return size if sampler == "snis" else size * (steps + 1)
 
 
@@ -106,7 +111,7 @@ def read_metrics(run_dir: Path) -> list[dict[str, str]]:
     return [rows]
 
 
-TAG = re.compile(r"^(?P<sampler>snis|smc)_n(?P<size>\d+)(?:_s(?P<steps>\d+))?"
+TAG = re.compile(r"^(?P<sampler>snis|smc|ais)_n(?P<size>\d+)(?:_s(?P<steps>\d+))?"
                  r"_seed(?P<seed>\d+)(?:_m(?P<model_seed>\d+))?$")
 
 
@@ -119,6 +124,22 @@ def found_runs(out: Path) -> list[tuple[str, int, int, int, int]]:
             runs.append((m["sampler"], int(m["size"]), int(m["steps"] or 0),
                          int(m["seed"]), int(m["model_seed"] or 0)))
     return runs
+
+
+def minutes(run_dir: Path) -> str:
+    """Wall-clock from the hydra log's first and last timestamps."""
+    log = run_dir / "eval.log"
+    if not log.exists():
+        return ""
+    stamps = [line[1:20] for line in log.read_text().splitlines() if line.startswith("[20")]
+    if len(stamps) < 2:
+        return ""
+    fmt = "%Y-%m-%d %H:%M:%S"
+    try:
+        a, b = (datetime.datetime.strptime(x, fmt) for x in (stamps[0], stamps[-1]))
+    except ValueError:
+        return ""
+    return f"{(b - a).total_seconds() / 60:.1f}"
 
 
 def collect(out: Path, jobs: list[tuple[str, int, int, int, int]] | None = None) -> None:
@@ -135,7 +156,8 @@ def collect(out: Path, jobs: list[tuple[str, int, int, int, int]] | None = None)
         metrics = read_metrics(out / run_tag(sampler, size, steps, seed, model_seed))[0]
         row = {"sampler": sampler, "num_samples": size, "steps": steps,
                "seed": seed, "model_seed": model_seed,
-               "target_energy_evals": target_evals(sampler, size, steps)}
+               "target_energy_evals": target_evals(sampler, size, steps),
+               "minutes": minutes(out / run_tag(sampler, size, steps, seed, model_seed))}
         for key, value in metrics.items():
             if any(key.endswith(m) for m in METRICS):
                 row[key.replace("test/", "")] = value
@@ -145,7 +167,7 @@ def collect(out: Path, jobs: list[tuple[str, int, int, int, int]] | None = None)
         return
     columns = sorted({k for row in summary for k in row}, key=lambda k: (k not in
                      ("sampler", "num_samples", "steps", "seed", "model_seed",
-                      "target_energy_evals"), k))
+                      "target_energy_evals", "minutes"), k))
     path = out / "summary.csv"
     with open(path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns)
@@ -163,10 +185,11 @@ def main() -> None:
     p.add_argument("--sizes", type=int, nargs="+", default=[10_000, 100_000, 1_000_000],
                    help="SNIS sample counts to sweep")
     p.add_argument("--smc-sizes", type=int, nargs="+", default=[10_000],
-                   help="SMC particle counts (its cost is this times the step count)")
+                   help="particle counts for ais/smc (cost is this times the step count)")
     p.add_argument("--system", choices=SYSTEMS, default="Ace-A-Nme", help="which peptide to evaluate")
-    p.add_argument("--samplers", nargs="+", choices=("snis", "smc"), default=["snis"],
-                   help="SMC is off by default: take its numbers from the paper's tables")
+    p.add_argument("--samplers", nargs="+", choices=("snis", "ais", "smc"), default=["snis"],
+                   help="ais/smc rerun the annealed arms in this pipeline (same config, "
+                        "resampling disabled for ais)")
     p.add_argument("--steps", type=int, default=100, help="SMC annealing steps")
     p.add_argument("--seeds", type=int, nargs="+", default=[0], help="sampling seeds (Monte Carlo noise)")
     p.add_argument("--model-seeds", type=int, nargs="+", default=[0], choices=(0, 1, 2),
