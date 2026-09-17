@@ -39,8 +39,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EVAL = REPO_ROOT / "src" / "transferable_samplers" / "eval.py"
 SNIS_EXPERIMENT = "single_system/eval/tarflow_Ace-A-Nme_snis"
 SMC_EXPERIMENT = "single_system/eval/tarflow_Ace-A-Nme_ula"
-# metrics worth keeping; the evaluator prefixes them with "test/<sequence>/<sample set>/"
-METRICS = ("energy-w2", "torsion-w2", "tica-w2", "effective-sample-size", "num-eval-samples")
+# metrics worth keeping; the evaluator prefixes them with "test/<sequence>/<sample set>/".
+# The paper's T-W2 is logged as "torus-w2"; "energy-w1" is the tail-sensitive companion to energy-w2.
+METRICS = ("energy-w2", "energy-w1", "torus-w2", "torus-k-jsd", "tica-w2", "tica-k-jsd",
+           "effective-sample-size", "num-eval-samples")
 
 
 def subprocess_env() -> dict[str, str]:
