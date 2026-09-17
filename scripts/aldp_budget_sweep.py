@@ -50,6 +50,15 @@ def subprocess_env() -> dict[str, str]:
     return {**os.environ, "PYTHONPATH": src + (os.pathsep + existing if existing else "")}
 
 
+def check_scratch_dir() -> None:
+    """hydra resolves paths from SCRATCH_DIR, set in the shell or in the repo's .env (see .env.example)."""
+    if (REPO_ROOT / ".env").exists() or os.environ.get("SCRATCH_DIR"):
+        return
+    sys.exit("SCRATCH_DIR is not set and no .env exists: `cp .env.example .env` and edit it, or "
+             "`export SCRATCH_DIR=<dir holding transferable-samplers/many-peptides-md>`. "
+             "Note eval.py loads .env with override=True, so .env wins over the shell.")
+
+
 def run_tag(sampler: str, size: int, steps: int, seed: int) -> str:
     return f"{sampler}_n{size}" + (f"_s{steps}" if sampler == "smc" else "") + f"_seed{seed}"
 
@@ -138,6 +147,7 @@ def main() -> None:
     if args.collect:
         collect(out, jobs)
         return
+    check_scratch_dir()
     out.mkdir(parents=True, exist_ok=True)
     for sampler, size, steps, seed in jobs:
         tag = run_tag(sampler, size, steps, seed)
