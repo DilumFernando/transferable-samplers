@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -105,16 +106,34 @@ def read_metrics(run_dir: Path) -> list[dict[str, str]]:
     return [rows]
 
 
-def collect(out: Path, jobs: list[tuple[str, int, int, int]]) -> None:
+TAG = re.compile(r"^(?P<sampler>snis|smc)_n(?P<size>\d+)(?:_s(?P<steps>\d+))?"
+                 r"_seed(?P<seed>\d+)(?:_m(?P<model_seed>\d+))?$")
+
+
+def found_runs(out: Path) -> list[tuple[str, int, int, int, int]]:
+    """Every finished run in `out`, read off the directory names rather than the current flags."""
+    runs = []
+    for d in sorted(p for p in out.iterdir() if p.is_dir()):
+        m = TAG.match(d.name)
+        if m and read_metrics(d):
+            runs.append((m["sampler"], int(m["size"]), int(m["steps"] or 0),
+                         int(m["seed"]), int(m["model_seed"] or 0)))
+    return runs
+
+
+def collect(out: Path, jobs: list[tuple[str, int, int, int, int]] | None = None) -> None:
+    """Summarise every finished run in `out`; `jobs` only adds "not finished" lines for expected runs."""
+    if not out.is_dir():
+        print(f"no results directory {out}")
+        return
+    runs = found_runs(out)
+    for job in jobs or []:
+        if job not in runs:
+            print(f"  {run_tag(job[0], job[1], job[2], job[3], job[4])}: not finished")
     summary = []
-    for sampler, size, steps, seed, model_seed in jobs:
-        tag = run_tag(sampler, size, steps, seed, model_seed)
-        found = read_metrics(out / tag)
-        if not found:
-            print(f"  {tag}: no metrics yet")
-            continue
-        metrics = found[0]
-        row = {"sampler": sampler, "num_samples": size, "steps": steps if sampler == "smc" else 0,
+    for sampler, size, steps, seed, model_seed in runs:
+        metrics = read_metrics(out / run_tag(sampler, size, steps, seed, model_seed))[0]
+        row = {"sampler": sampler, "num_samples": size, "steps": steps,
                "seed": seed, "model_seed": model_seed,
                "target_energy_evals": target_evals(sampler, size, steps)}
         for key, value in metrics.items():
@@ -165,7 +184,7 @@ def main() -> None:
     jobs = [(s, n, args.steps, seed, m) for m in args.model_seeds for seed in args.seeds
             for s in args.samplers for n in (args.sizes if s == "snis" else args.smc_sizes)]
     if args.collect:
-        collect(out, jobs)
+        collect(out)                       # every finished run in the folder, whatever the flags
         return
     check_scratch_dir()
     out.mkdir(parents=True, exist_ok=True)
